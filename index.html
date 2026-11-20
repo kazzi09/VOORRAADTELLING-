@@ -1,0 +1,211 @@
+function doGet(e) {
+  var sessionCode = (e && e.parameter && e.parameter.sessionCode) ? String(e.parameter.sessionCode) : 'DEFAULT-SESSION';
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheets = ss.getSheets();
+  var results = [];
+  var stockRows = [];
+
+  var stockSheet = ss.getSheetByName('StockRows');
+  if (stockSheet) {
+    var sVals = stockSheet.getDataRange().getValues();
+    for (var k = 1; k < sVals.length; k++) {
+      if (String(sVals[k][0]) === sessionCode && sVals[k][2]) {
+        stockRows.push({
+          location: String(sVals[k][1] || ''),
+          sscc: String(sVals[k][2] || ''),
+          name: String(sVals[k][3] || ''),
+          systemQty: String(sVals[k][4] || '')
+        });
+      }
+    }
+  }
+
+  for (var s = 0; s < sheets.length; s++) {
+    var sh = sheets[s];
+    var shName = sh.getName();
+    if (shName === 'Ozet' || shName === 'Summary' || shName === 'StockRows') continue;
+    if (shName === 'TellingSync' || shName.indexOf('Sync_') === 0 || (shName !== 'Sayfa1' && shName !== 'Sheet1')) {
+      var values = sh.getDataRange().getValues();
+      for (var i = 1; i < values.length; i++) {
+        if (String(values[i][0]) === sessionCode && values[i][1]) {
+          results.push({
+            id: String(values[i][1] || ''),
+            location: String(values[i][2] || ''),
+            sscc: String(values[i][3] || ''),
+            name: String(values[i][4] || ''),
+            counter: String(values[i][5] || shName),
+            systemQty: String(values[i][6] || ''),
+            counted: Number(values[i][7] || 0),
+            variance: Number(values[i][8] || 0),
+            updatedAt: Number(values[i][9] || 0)
+          });
+        }
+      }
+    }
+  }
+
+  return ContentService
+    .createTextOutput(JSON.stringify({ ok: true, sessionCode: sessionCode, results: results, rows: stockRows }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
+  var payload = {};
+  try {
+    payload = JSON.parse((e && e.postData && e.postData.contents) ? e.postData.contents : '{}');
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: 'Invalid JSON' })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  var sessionCode = String(payload.sessionCode || 'DEFAULT-SESSION');
+  var defaultOperator = String(payload.operator || 'Counter');
+  var incoming = Array.isArray(payload.results) ? payload.results : [];
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  if (Array.isArray(payload.rows) && payload.rows.length > 0) {
+    saveStockRows(ss, sessionCode, payload.rows);
+  }
+
+  incoming.forEach(function(item) {
+    if (!item || !item.id) return;
+    var opName = String(item.counter || defaultOperator || 'Counter').trim() || 'Counter';
+    var safeSheetName = sanitizeSheetName(opName);
+    var sheet = getOrCreateOperatorSheet(ss, safeSheetName);
+
+    var lastRow = sheet.getLastRow();
+    var foundRow = -1;
+    var existingUpdatedAt = 0;
+
+    if (lastRow > 1) {
+      var existing = sheet.getRange(2, 1, lastRow - 1, 10).getValues();
+      for (var r = 0; r < existing.length; r++) {
+        if (String(existing[r][0]) === sessionCode && String(existing[r][1]) === String(item.id)) {
+          foundRow = r + 2;
+          existingUpdatedAt = Number(existing[r][9] || 0);
+          break;
+        }
+      }
+    }
+
+    var ts = Number(item.updatedAt || Date.now());
+    var rowData = [
+      sessionCode,
+      String(item.id),
+      String(item.location || ''),
+      String(item.sscc || ''),
+      String(item.name || ''),
+      opName,
+      String(item.systemQty || ''),
+      Number(item.counted || 0),
+      Number(item.variance || 0),
+      ts
+    ];
+
+    if (foundRow > 0) {
+      if (ts >= existingUpdatedAt) {
+        sheet.getRange(foundRow, 1, 1, 10).setValues([rowData]);
+      }
+    } else {
+      sheet.appendRow(rowData);
+    }
+  });
+
+  if (incoming.length > 0) {
+    rebuildOzetSheet(ss);
+  }
+
+  return ContentService
+    .createTextOutput(JSON.stringify({ ok: true, merged: incoming.length }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function saveStockRows(ss, sessionCode, stockList) {
+  var sh = ss.getSheetByName('StockRows');
+  if (!sh) {
+    sh = ss.insertSheet('StockRows');
+    sh.appendRow(['SessionCode','Location','SSCC','Product','SystemQty']);
+  }
+  var lastRow = sh.getLastRow();
+  var kept = [];
+  if (lastRow > 1) {
+    var existing = sh.getRange(2, 1, lastRow - 1, 5).getValues();
+    for (var i = 0; i < existing.length; i++) {
+      if (String(existing[i][0]) !== sessionCode) {
+        kept.push(existing[i]);
+      }
+    }
+  }
+  stockList.forEach(function(item) {
+    if (!item || !item.sscc) return;
+    kept.push([
+      sessionCode,
+      String(item.location || ''),
+      String(item.sscc || ''),
+      String(item.name || ''),
+      String(item.systemQty || '')
+    ]);
+  });
+  sh.clearContents();
+  sh.appendRow(['SessionCode','Location','SSCC','Product','SystemQty']);
+  if (kept.length > 0) {
+    sh.getRange(2, 1, kept.length, 5).setValues(kept);
+  }
+}
+
+function rebuildOzetSheet(ss) {
+  var ozet = ss.getSheetByName('Ozet');
+  if (!ozet) {
+    ozet = ss.insertSheet('Ozet', 0);
+  }
+  ozet.clearContents();
+  ozet.appendRow(['SessionCode','Counter','Location','SSCC','Product','SystemQty','Counted','Variance','UpdatedAt']);
+
+  var sheets = ss.getSheets();
+  var allRows = [];
+
+  for (var s = 0; s < sheets.length; s++) {
+    var sh = sheets[s];
+    var shName = sh.getName();
+    if (shName === 'Ozet' || shName === 'Summary' || shName === 'StockRows' || shName === 'Sayfa1' || shName === 'Sheet1') continue;
+    var vals = sh.getDataRange().getValues();
+    for (var i = 1; i < vals.length; i++) {
+      if (vals[i][1]) {
+        allRows.push([
+          String(vals[i][0] || ''),
+          String(vals[i][5] || shName),
+          String(vals[i][2] || ''),
+          String(vals[i][3] || ''),
+          String(vals[i][4] || ''),
+          String(vals[i][6] || ''),
+          Number(vals[i][7] || 0),
+          Number(vals[i][8] || 0),
+          Number(vals[i][9] || 0)
+        ]);
+      }
+    }
+  }
+
+  allRows.sort(function(a, b) {
+    if (a[1] !== b[1]) return a[1].localeCompare(b[1]);
+    return a[2].localeCompare(b[2]);
+  });
+
+  if (allRows.length > 0) {
+    ozet.getRange(2, 1, allRows.length, 9).setValues(allRows);
+  }
+}
+
+function sanitizeSheetName(name) {
+  var cleaned = String(name || 'Counter').replace(/[\\/?*[\]]/g, '_').trim();
+  if (!cleaned) cleaned = 'Counter';
+  return cleaned.slice(0, 95);
+}
+
+function getOrCreateOperatorSheet(ss, sheetName) {
+  var sh = ss.getSheetByName(sheetName);
+  if (!sh) {
+    sh = ss.insertSheet(sheetName);
+    sh.appendRow(['SessionCode','Id','Location','SSCC','Product','Counter','SystemQty','Counted','Variance','UpdatedAt']);
+  }
+  return sh;
+}
